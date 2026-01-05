@@ -1,5 +1,5 @@
 from utils.wrappers import ResizeObservationWrapper
-from utils.misc import RESIZE_LENGTH
+from utils.misc import RESIZE_SIZE
 
 import gymnasium as gym
 import math

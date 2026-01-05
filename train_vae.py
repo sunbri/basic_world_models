@@ -1,148 +1,184 @@
-from models.vae import VModel, vae_loss_function
+from models.vae import VAE, vae_loss_function
+from data.loaders import BufferedRolloutDataset
+from utils.misc import RESIZE_SIZE, LATENT_SIZE, save_checkpoint
 
+import argparse
 import glob
-import numpy as np
-import os
+from os.path import exists, join
+from os import mkdir
+import random
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 import torch.optim as optim
-from torch.utils.data import IterableDataset, DataLoader, random_split
+from torch.utils.data import DataLoader
 from torchvision import transforms
+from torchvision.utils import save_image
 
-class StreamingRolloutDataset(IterableDataset):
-    """
-    Efficiently loads 'chunks' (entire .npz files) at once to minimize disk seeking.
-    """
-    def __init__(self, data_dir, transform=None):
-        self.data_dir = data_dir
-        self.file_paths = glob.glob(os.path.join(data_dir, "*.npz"))
-        self.transform = transform
-        
-        if not self.file_paths:
-            raise ValueError(f"No .npz files found in {data_dir}")
-        
-        # Calculate approximate length for progress bars (optional)
-        # Assuming ~1000 frames per file
-        self.est_length = len(self.file_paths) * 1000 
+def main():
+    parser = argparse.ArgumentParser(description='VAE Trainer')
+    parser.add_argument('--data-dir', type=str, default='datasets/carracing', 
+                        help='Path to .npz files')
+    parser.add_argument('--save-dir', type=str, default='logs', 
+                        help='Path to save model data')
+    parser.add_argument('--batch-size', type=int, default=32,
+                        help='input batch size for training (default: 32)')
+    parser.add_argument('--epochs', type=int, default=10,
+                        help='number of epochs to train (default: 10)')
+    parser.add_argument('--no-reload', action='store_true',
+                        help='Best model is not reloaded if specified')
+    parser.add_argument('--no-samples', action='store_true',
+                        help='Does not save samples during training')
 
-    def process_data(self, data):
-        """Convert uint8 (H, W, C) -> float32 (C, H, W) normalized"""
-        # 1. Convert to Float Tensor [0.0, 1.0]
-        tensor = torch.from_numpy(data).float() / 255.0
-        # 2. Permute dimensions (H,W,C) -> (C,H,W)
-        tensor = tensor.permute(2, 0, 1)
-        return tensor
+    args = parser.parse_args()
+    if not exists(args.save_dir):
+        mkdir(args.save_dir)
 
-    def __iter__(self):
-        """
-        This is where the magic happens. 
-        Each Worker process calls this function independently.
-        """
-        worker_info = torch.utils.data.get_worker_info()
-        
-        # 1. Split files among workers
-        if worker_info is None:
-            # Single-process data loading
-            my_files = self.file_paths
-        else:
-            # Multi-process: Split the file list evenly
-            per_worker = int(np.ceil(len(self.file_paths) / float(worker_info.num_workers)))
-            worker_id = worker_info.id
-            start = worker_id * per_worker
-            end = min(start + per_worker, len(self.file_paths))
-            my_files = self.file_paths[start:end]
+    vae_dir = join(args.save_dir, 'vae')
+    if not exists(vae_dir):
+        mkdir(vae_dir)
+        mkdir(join(vae_dir, 'samples'))
 
-        # 2. Shuffle files so workers don't always read in the same order (optional but good)
-        np.random.shuffle(my_files)
-
-        # 3. The "Chunk" Loading Loop
-        for fpath in my_files:
-            try:
-                # FAST: Load the entire 1000-frame chunk into RAM at once
-                with np.load(fpath) as data:
-                    observations = data['observations'] # Shape (T, 64, 64, 3)
-
-                # MIXING: Shuffle indices *within* this chunk.
-                # This prevents the batch from having 128 consecutive frames (which are identical).
-                indices = np.random.permutation(len(observations))
-
-                # Yield frames one by one from the cached chunk
-                for idx in indices:
-                    yield self.process_data(observations[idx])
-
-            except Exception as e:
-                print(f"Error loading {fpath}: {e}")
-                continue
-
-    def __len__(self):
-        # Only used by tqdm for progress bar estimates
-        return self.est_length
-
-def train(args):
-    device = torch.cuda("cuda" if torch.cuda.is_available() else "cpu")
+    torch.manual_seed(123)
+    mps = torch.backends.mps.is_available()
+    device = torch.device("cuda" if torch.cuda.is_available() 
+                        else ("mps" if torch.backends.mps.is_available() else "cpu"))
     print(f"Using device: {device}")
 
-    # Setup data
-    dataset = StreamingRolloutDataset(args.data_dir)
+    # get train and test data
+    all_files = sorted(glob.glob(join(args.data_dir, "*.npz")))
+    random.shuffle(all_files)
+    split_idx = int(0.9 * len(all_files))
+    train_files = all_files[:split_idx]
+    test_files = all_files[split_idx:]
 
-    loader = DataLoader(
-        dataset,
-        batch_size=args.batch_size,
-        num_workers=args.workers,
-        pin_memory=True
+    print(f"Total Files: {len(all_files)}")
+    print(f"Train Split: {len(train_files)} files")
+    print(f"Test Split:  {len(test_files)} files")
+
+    transform_train = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.RandomHorizontalFlip(),
+    ])
+    transform_test = transforms.Compose([
+        transforms.ToTensor(),
+    ])
+
+    train_dataset = BufferedRolloutDataset(
+        source=train_files,
+        mode='ae',
+        transform=transform_train
+    )
+    test_dataset = BufferedRolloutDataset(
+        source=test_files,
+        mode='ae',
+        transform=transform_test
     )
 
-    model = VModel(latent_size=32).to(device)
-    optimizer = optim.Adam(model.parameters(), lr=1e-3)
+    train_loader = DataLoader(train_dataset, 
+                              batch_size=args.batch_size, 
+                              num_workers=4, 
+                              shuffle=False)
+    test_loader = DataLoader(test_dataset, 
+                             batch_size=args.batch_size, 
+                             num_workers=2, 
+                             shuffle=False)
 
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=2)
+    model = VAE(latent_size=32).to(device)
 
-    print(f"Starting training on approximately {len(dataset)} frames...")
+    estimated_total_frames = len(train_files) * 1000
+    steps_per_epoch = estimated_total_frames // args.batch_size
 
-    for epoch in range(1, args.epochs + 1):
+    # AdamW with milder weight decay for a "sharper" decoder
+    optimizer = optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-5)
+    scheduler = optim.lr_scheduler.OneCycleLR(
+        optimizer,
+        max_lr=1e-3,
+        steps_per_epoch=steps_per_epoch,
+        pct_start=0.1,
+        epochs=args.epochs
+    )
+
+    epoch = 1
+
+    # reload best so far
+    reload_file = join(vae_dir, 'best.tar')
+    if not args.no_reload and exists(reload_file):
+        state = torch.load(reload_file)
+        print(f"Reloading model after epoch {state['epoch']} \
+and test error {state['precision']}")
+        model.load_state_dict(state['state_dict'])
+        optimizer.load_state_dict(state['optimizer'])
+        scheduler.load_state_dict(state['scheduler'])
+        # we save at the end
+        epoch = state['epoch'] + 1
+
+    curr_best = None
+
+    # start at epoch 1
+    while epoch < args.epochs + 1:
         model.train()
-        total_loss = 0
+        train_loss = 0
         batch_count = 0
 
-        for batch_idx, x in enumerate(loader):
+        # Training Loop
+        for batch_idx, x in enumerate(train_loader):
             x = x.to(device)
-
             optimizer.zero_grad()
-
-            # Forward
             recon_x, mu, logvar = model(x)
-
-            # Loss
-            loss = vae_loss_function(recon_x, x, mu, logvar)
-
+            loss, recon_loss, kl_loss = vae_loss_function(recon_x, x, mu, logvar)
             loss.backward()
             optimizer.step()
-
-            total_loss += loss.item()
+            scheduler.step()
+            train_loss += loss.item()
             batch_count += 1
 
             if batch_idx % 100 == 0:
-                print(f"Epoch {epoch} | Batch {batch_idx} | Loss: {loss.item() / len(x):.4f}")
+                print(f"Epoch {epoch} | Batch {batch_idx} | Loss: {loss.item():.4f} \
+(Recon: {recon_loss.item():.4f}, KL: {kl_loss.item():.4f})")
         
-        avg_loss = total_loss / batch_count
+        avg_loss = train_loss / batch_count
         print(f"====> Epoch {epoch} Average Loss: {avg_loss:.4f}")
 
-        save_path = os.path.join(args.save_dir, "vae_latest.pth")
-        torch.save(model.state_dict(), save_path)
+        # Validation Loop
+        model.eval()
+        test_total_loss = 0
+        test_batch_count = 0
+        with torch.no_grad():
+            for test_batch_index, x in enumerate(test_loader):
+                x = x.to(device)
+                recon_x, mu, logvar = model(x)
+                test_loss, test_recon_loss, test_kl_loss = vae_loss_function(recon_x, x, mu, logvar)
+                test_total_loss += test_loss.item()
+                test_batch_count += 1
+                if test_batch_index % 100 == 0:
+                    print(f"Test | Loss: {test_loss.item():.4f} \
+(Recon: {test_recon_loss.item():.4f}, KL: {test_kl_loss.item():.4f})")
 
-        scheduler.step(avg_loss)
+            test_total_loss /= test_batch_count
+            print(f"====> Test set loss: {test_total_loss:.4f}")
+
+        # Checkpointing
+        best_filename = join(vae_dir, 'best.tar')
+        filename = join(vae_dir, 'checkpoint.tar')
+        is_best = not curr_best or test_loss < curr_best
+        if is_best:
+            curr_best = test_loss
+
+        save_checkpoint({
+            'epoch': epoch,
+            'precision': test_loss,
+            'state_dict': model.state_dict(),
+            'optimizer': optimizer.state_dict(),
+            'scheduler': scheduler.state_dict(),
+        }, is_best, filename, best_filename)
+
+        # sample from VAE
+        with torch.no_grad():
+            sample = torch.randn(64, LATENT_SIZE).to(device)
+            sample = model.decoder(sample).cpu()
+            save_image(sample.view(64, 3, RESIZE_SIZE, RESIZE_SIZE),
+                        join(vae_dir, 'samples/sample_' + str(epoch) + '.png'))
+    
+    epoch += 1
 
 if __name__ == "__main__":
-    import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--data_dir', type=str, default='datasets/carracing', help='Path to .npz files')
-    parser.add_argument('--save_dir', type=str, default='weights', help='Path to save model weights')
-    parser.add_argument('--batch_size', type=int, default=128)
-    parser.add_argument('--epochs', type=int, default=20)
-    
-    args = parser.parse_args()
-    
-    if not os.path.exists(args.save_dir):
-        os.makedirs(args.save_dir)
-    
+    main()

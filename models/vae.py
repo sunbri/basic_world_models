@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 # Variational Autoencoder built as a CNN
-class VModel(nn.Module):
+class VAE(nn.Module):
     def __init__(self, image_channels=3, latent_size=32):
         super().__init__()
         self.latent_size = latent_size
@@ -48,10 +48,13 @@ class VModel(nn.Module):
         # Decoder
         # Input: Latent Z -> Output: (B, 3, 64, 64)
         # ==========================================================
-        # The decoder starts by projecting z to 1024, which we reshape to (1024, 1, 1)
-        self.decoder_input = nn.Linear(latent_size, 1024)
-        
         self.decoder = nn.Sequential(
+            # Expand Latent to 1024 features
+            nn.Linear(latent_size, 1024),
+
+            # Reshape from (B, 1024) -> (B, 1024, 1, 1)
+            nn.Unflatten(dim=1, unflattened_size=(1024, 1, 1)),
+
             # Layer 1: Input (1024, 1, 1) -> Output (128, 5, 5)
             # Math: (1-1)*2 + 5 = 5
             nn.ConvTranspose2d(1024, 128, kernel_size=5, stride=2),
@@ -73,6 +76,7 @@ class VModel(nn.Module):
             nn.Sigmoid()
         )
 
+    # Reparameterization "trick" for gradient flow
     def reparameterize(self, mu, logvar):
         if self.training:
             std = torch.exp(0.5 * logvar)
@@ -96,10 +100,7 @@ class VModel(nn.Module):
         z = self.reparameterize(mu, logvar)
 
         # 4. Decode
-        z_projected = self.decoder_input(z)
-        # Reshape to (B, 1024, 1, 1) to match the decoder's first kernel depth
-        z_projected = z_projected.view(-1, 1024, 1, 1) 
-        reconstruction = self.decoder(z_projected)
+        reconstruction = self.decoder(z)
 
         return reconstruction, mu, logvar
 
@@ -109,7 +110,9 @@ def vae_loss_function(recon_x, x, mu, logvar, beta=1.0):
     """
     # 1. Reconstruction Loss (Sum over pixels, then Mean over batch)
     # reduction='sum' sums ALL pixels in the batch. We divide by batch_size to get the average per-image error.
-    recon_loss = F.mse_loss(recon_x, x, reduction='mean')
+    # POSSIBLY SWITCH TO BCE!
+    recon_loss = F.mse_loss(recon_x, x, reduction='sum')
+    recon_loss = recon_loss.div(x.size(0))
 
     # 2. KL Divergence (Sum over latent dimensions, then Mean over batch)
     # -0.5 * sum(1 + logvar - mu^2 - exp(logvar))

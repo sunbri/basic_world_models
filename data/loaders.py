@@ -1,0 +1,142 @@
+import torch
+from torch.utils.data import IterableDataset
+import numpy as np
+import glob
+import os
+import math
+
+class BufferedRolloutDataset(IterableDataset):
+    def __init__(self, source, file_buffer_size=20, mode='rl', transform=None):
+        """
+        Args:
+            source (str or list): 
+                - If str: Path to directory (loads all .npz files inside).
+                - If list: List of specific file paths (good for train/test splits).
+            file_buffer_size (int): Number of files to load into RAM at once.
+            mode (str): 'ae' (observations only) or 'rl' (obs, next_obs, actions, rewards, terminals).
+            transform (callable, optional): Transform to apply to observations (e.g. Normalization).
+        """
+        super().__init__()
+        
+        # 1. Flexible Input Handling
+        if isinstance(source, str):
+            # User passed a directory string
+            self.file_paths = sorted(glob.glob(os.path.join(source, "*.npz")))
+            if len(self.file_paths) == 0:
+                raise ValueError(f"No .npz files found in directory: {source}")
+        elif isinstance(source, list):
+            # User passed a specific list of files
+            self.file_paths = source
+        else:
+            raise TypeError("Source must be a directory path (str) or list of files.")
+
+        self.file_buffer_size = file_buffer_size
+        self.mode = mode
+        self.transform = transform
+        
+        assert mode in ['ae', 'rl'], "Mode must be 'ae' or 'rl'"
+
+    def _load_data_from_files(self, files):
+        buffer_data = {
+            'observations': [],
+            'next_observations': [],
+            'actions': [],
+            'rewards': [],
+            'terminals': []
+        }
+
+        for file_path in files:
+            try:
+                with np.load(file_path) as data:
+                    raw_obs = data['observations'] # Shape (T+1, ...)
+                    
+                    if self.mode == 'ae':
+                        # AE Mode: Load everything including the extra frame
+                        buffer_data['observations'].append(raw_obs)
+                        
+                    elif self.mode == 'rl':
+                        # RL Mode: Align Obs(t) with Act(t)
+                        raw_actions = data['actions']
+                        T = len(raw_actions)
+
+                        # Obs = 0 to T-1
+                        buffer_data['observations'].append(raw_obs[:T])
+                        # Next Obs = 1 to T
+                        buffer_data['next_observations'].append(raw_obs[1:T+1])
+                        
+                        buffer_data['actions'].append(raw_actions)
+                        buffer_data['rewards'].append(data['rewards'])
+                        buffer_data['terminals'].append(data['terminals'])
+                        
+            except Exception as e:
+                print(f"Error loading {file_path}: {e}")
+                continue
+
+        # Concatenate whatever was loaded
+        final_buffer = {}
+        keys = ['observations'] if self.mode == 'ae' else ['observations', 'next_observations', 'actions', 'rewards', 'terminals']
+
+        for key in keys:
+            if buffer_data[key]:
+                final_buffer[key] = np.concatenate(buffer_data[key], axis=0)
+
+        return final_buffer
+
+    def __iter__(self):
+        worker_info = torch.utils.data.get_worker_info()
+        
+        # Worker Split Logic
+        if worker_info is None:
+            my_files = self.file_paths
+        else:
+            per_worker = int(math.ceil(len(self.file_paths) / float(worker_info.num_workers)))
+            worker_id = worker_info.id
+            iter_start = worker_id * per_worker
+            iter_end = min(iter_start + per_worker, len(self.file_paths))
+            my_files = self.file_paths[iter_start:iter_end]
+
+        # Global Shuffle (Files)
+        np.random.shuffle(my_files)
+
+        # Chunk Loop
+        for i in range(0, len(my_files), self.file_buffer_size):
+            file_chunk = my_files[i : i + self.file_buffer_size]
+            buffer = self._load_data_from_files(file_chunk)
+            
+            if 'observations' not in buffer:
+                continue
+
+            n_samples = len(buffer['observations'])
+            indices = np.random.permutation(n_samples) # Local Shuffle (Buffer)
+
+            for idx in indices:
+                # Observations start as uint8
+                obs = buffer['observations'][idx]
+                
+                # Apply Transform (uint8 -> float / normalize / augment)
+                if self.transform:
+                    obs = self.transform(obs)
+                else:
+                    obs = torch.from_numpy(obs).float()
+
+                if self.mode == 'ae':
+                    yield obs
+                else:
+                    # Apply transform to next_obs as well
+                    next_obs = buffer['next_observations'][idx]
+                    if self.transform:
+                        next_obs = self.transform(next_obs)
+                    else:
+                        next_obs = torch.from_numpy(next_obs).float()
+
+                    action = torch.from_numpy(buffer['actions'][idx]).float()
+                    reward = torch.tensor(buffer['rewards'][idx]).float()
+                    terminal = torch.tensor(buffer['terminals'][idx]).float()
+                    
+                    yield {
+                        'observation': obs,
+                        'next_observation': next_obs,
+                        'action': action, 
+                        'reward': reward, 
+                        'terminal': terminal
+                    }
