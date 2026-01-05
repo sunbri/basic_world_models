@@ -1,0 +1,1 @@
+RESIZE_LENGTH = 64
