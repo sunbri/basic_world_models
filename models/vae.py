@@ -110,7 +110,6 @@ def vae_loss_function(recon_x, x, mu, logvar, beta=1.0):
     """
     # 1. Reconstruction Loss (Sum over pixels, then Mean over batch)
     # reduction='sum' sums ALL pixels in the batch. We divide by batch_size to get the average per-image error.
-    # POSSIBLY SWITCH TO BCE!
     recon_loss = F.mse_loss(recon_x, x, reduction='sum')
     recon_loss = recon_loss.div(x.size(0))
 

@@ -1,6 +1,6 @@
 from models.vae import VAE, vae_loss_function
 from data.loaders import BufferedRolloutDataset
-from utils.misc import RESIZE_SIZE, LATENT_SIZE, save_checkpoint
+from utils.misc import RESIZE_SIZE, LATENT_SIZE, save_checkpoint, setup_logger
 
 import argparse
 import glob
@@ -37,11 +37,12 @@ def main():
         mkdir(vae_dir)
         mkdir(join(vae_dir, 'samples'))
 
+    logger = setup_logger(vae_dir, "VAE")
+
     torch.manual_seed(123)
-    mps = torch.backends.mps.is_available()
     device = torch.device("cuda" if torch.cuda.is_available() 
                         else ("mps" if torch.backends.mps.is_available() else "cpu"))
-    print(f"Using device: {device}")
+    logger.info(f"Using device: {device}")
 
     # get train and test data
     all_files = sorted(glob.glob(join(args.data_dir, "*.npz")))
@@ -50,9 +51,9 @@ def main():
     train_files = all_files[:split_idx]
     test_files = all_files[split_idx:]
 
-    print(f"Total Files: {len(all_files)}")
-    print(f"Train Split: {len(train_files)} files")
-    print(f"Test Split:  {len(test_files)} files")
+    logger.info(f"Total Files: {len(all_files)}")
+    logger.info(f"Train Split: {len(train_files)} files")
+    logger.info(f"Test Split:  {len(test_files)} files")
 
     transform_train = transforms.Compose([
         transforms.ToTensor(),
@@ -84,7 +85,8 @@ def main():
 
     model = VAE(latent_size=32).to(device)
 
-    estimated_total_frames = len(train_files) * 1000
+    # recall that there is an extra first observation
+    estimated_total_frames = len(train_files) * 1001
     steps_per_epoch = estimated_total_frames // args.batch_size
 
     # AdamW with milder weight decay for a "sharper" decoder
@@ -103,7 +105,7 @@ def main():
     reload_file = join(vae_dir, 'best.tar')
     if not args.no_reload and exists(reload_file):
         state = torch.load(reload_file)
-        print(f"Reloading model after epoch {state['epoch']} \
+        logger.info(f"Reloading model after epoch {state['epoch']} \
 and test error {state['precision']}")
         model.load_state_dict(state['state_dict'])
         optimizer.load_state_dict(state['optimizer'])
@@ -114,7 +116,7 @@ and test error {state['precision']}")
     curr_best = None
 
     # start at epoch 1
-    while epoch < args.epochs + 1:
+    while epoch <= args.epochs:
         model.train()
         train_loss = 0
         batch_count = 0
@@ -131,12 +133,34 @@ and test error {state['precision']}")
             train_loss += loss.item()
             batch_count += 1
 
-            if batch_idx % 100 == 0:
-                print(f"Epoch {epoch} | Batch {batch_idx} | Loss: {loss.item():.4f} \
-(Recon: {recon_loss.item():.4f}, KL: {kl_loss.item():.4f})")
+            # log training rate and gradient norm
+            if batch_idx % 1000 == 0:
+                # 1. Get current Learning Rate
+                # optimizers can have multiple groups, usually we just want the first one
+                current_lr = optimizer.param_groups[0]['lr']
+                
+                # 2. Get Gradient Norm (Optional, checks stability)
+                # Calculates the size of the gradient vector. If > 1.0 (your clip limit), 
+                # it means clipping is active.
+                total_norm = 0
+                for p in model.parameters():
+                    if p.grad is not None:
+                        param_norm = p.grad.data.norm(2)
+                        total_norm += param_norm.item() ** 2
+                total_norm = total_norm ** 0.5
+
+                # 3. Log it
+                logger.info(
+                    f"Epoch {epoch} | Batch {batch_idx} | "
+                    f"Loss: {loss.item():.2f} | "
+                    f"Recon: {recon_loss.item():.2f} | "
+                    f"KL: {kl_loss.item():.2f} | "
+                    f"LR: {current_lr:.6f} | "
+                    f"GradNorm: {total_norm:.4f}"
+                )
         
         avg_loss = train_loss / batch_count
-        print(f"====> Epoch {epoch} Average Loss: {avg_loss:.4f}")
+        logger.info(f"====> Epoch {epoch} Average Loss: {avg_loss:.4f}")
 
         # Validation Loop
         model.eval()
@@ -149,23 +173,27 @@ and test error {state['precision']}")
                 test_loss, test_recon_loss, test_kl_loss = vae_loss_function(recon_x, x, mu, logvar)
                 test_total_loss += test_loss.item()
                 test_batch_count += 1
-                if test_batch_index % 100 == 0:
-                    print(f"Test | Loss: {test_loss.item():.4f} \
-(Recon: {test_recon_loss.item():.4f}, KL: {test_kl_loss.item():.4f})")
+                if test_batch_index % 1000 == 0:
+                    logger.info(
+                        f"Test | Batch {test_batch_index} | "
+                        f"Loss: {test_loss.item():.2f} | "
+                        f"Recon: {test_recon_loss.item():.2f} | "
+                        f"KL: {test_kl_loss.item():.2f} | "
+                    )
 
             test_total_loss /= test_batch_count
-            print(f"====> Test set loss: {test_total_loss:.4f}")
+            logger.info(f"====> Test set loss: {test_total_loss:.4f}")
 
         # Checkpointing
         best_filename = join(vae_dir, 'best.tar')
         filename = join(vae_dir, 'checkpoint.tar')
-        is_best = not curr_best or test_loss < curr_best
+        is_best = not curr_best or test_total_loss < curr_best
         if is_best:
-            curr_best = test_loss
+            curr_best = test_total_loss
 
         save_checkpoint({
             'epoch': epoch,
-            'precision': test_loss,
+            'precision': test_total_loss,
             'state_dict': model.state_dict(),
             'optimizer': optimizer.state_dict(),
             'scheduler': scheduler.state_dict(),
@@ -178,7 +206,7 @@ and test error {state['precision']}")
             save_image(sample.view(64, 3, RESIZE_SIZE, RESIZE_SIZE),
                         join(vae_dir, 'samples/sample_' + str(epoch) + '.png'))
     
-    epoch += 1
+        epoch += 1
 
 if __name__ == "__main__":
     main()
