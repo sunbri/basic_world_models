@@ -83,7 +83,7 @@ def main():
                              num_workers=2, 
                              shuffle=False)
 
-    model = VAE(latent_size=32).to(device)
+    model = VAE(latent_size=LATENT_SIZE).to(device)
 
     # recall that there is an extra first observation
     estimated_total_frames = len(train_files) * 1001

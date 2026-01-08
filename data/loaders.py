@@ -1,5 +1,5 @@
 import torch
-from torch.utils.data import IterableDataset
+from torch.utils.data import Dataset, IterableDataset
 import numpy as np
 import glob
 import os
@@ -140,3 +140,35 @@ class BufferedRolloutDataset(IterableDataset):
                         'reward': reward, 
                         'terminal': terminal
                     }
+
+class LatentSeqDataset(Dataset):
+    def __init__(self, data_dir, seq_len=32):
+        super().__init__()
+        self.data_dir = data_dir
+        self.seq_len = seq_len
+        self.files = [f for f in os.listdir(data_dir) if f.endswith('.npz')]
+        self.files.sort()
+
+    def __len__(self):
+        return len(self.files)
+
+    def __getitem__(self, index):
+        # Load one episode
+        filepath = os.path.join(self.data_dir, self.files[index])
+        data = np.load(filepath)
+
+        mu = data['mu'] # (1001, 32)
+        action = data['action'] # (1000, 3)
+
+        start_idx = np.random.randint(0, len(action) - self.seq_len)
+        end_idx = start_idx + self.seq_len
+
+        z_input = mu[start_idx : end_idx]
+        a_input = action[start_idx : end_idx]
+        z_target = mu[start_idx+1 : end_idx+1]
+
+        return {
+            'z_input': torch.FloatTensor(z_input),
+            'a_input': torch.FloatTensor(a_input),
+            'z_target': torch.FloatTensor(z_target)
+        }
