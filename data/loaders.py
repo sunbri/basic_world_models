@@ -1,10 +1,12 @@
+import glob
+import math
+import numpy as np
+import os
 import torch
 from torch.utils.data import Dataset, IterableDataset
-import numpy as np
-import glob
-import os
-import math
+from tqdm import tqdm
 
+# for training the VAE
 class BufferedRolloutDataset(IterableDataset):
     def __init__(self, source, file_buffer_size=20, mode='rl', transform=None):
         """
@@ -141,26 +143,55 @@ class BufferedRolloutDataset(IterableDataset):
                         'terminal': terminal
                     }
 
+# for training MDN-RNN, the latent vectors are small
+# load it all into RAM
 class LatentSeqDataset(Dataset):
-    def __init__(self, data_dir, seq_len=32):
+    def __init__(self, data_dir, seq_len=32, mode='train', split_ratio=0.9, epoch_repeat=50):
+        """
+        :param epoch_repeat: how many times to sample from each file
+        """
         super().__init__()
         self.data_dir = data_dir
         self.seq_len = seq_len
-        self.files = [f for f in os.listdir(data_dir) if f.endswith('.npz')]
-        self.files.sort()
+        self.epoch_repeat = epoch_repeat
 
+        all_files = [f for f in os.listdir(data_dir) if f.endswith('.npz')]
+        all_files.sort()
+
+        split_idx = int(len(all_files) * split_ratio)
+        if mode == 'train':
+            self.files = all_files[:split_idx]
+        elif mode == 'test':
+            self.files = all_files[split_idx:]
+            self.epoch_repeat = 10 # scan fewer times for test
+
+        # Load all data into RAM
+        self.data_cache = []
+        print(f"Pre-loading {mode} dataset into RAM...")
+
+        for f in tqdm(self.files):
+            path = os.path.join(data_dir, f)
+            with np.load(path) as data:
+                self.data_cache.append({
+                    'mu': np.copy(data['mu']),
+                    'action': np.copy(data['action'])
+                })
+
+    # this function determines the size of an epoch
     def __len__(self):
-        return len(self.files)
+        return len(self.files) * self.epoch_repeat
 
     def __getitem__(self, index):
-        # Load one episode
-        filepath = os.path.join(self.data_dir, self.files[index])
-        data = np.load(filepath)
+        file_idx = index % len(self.files)
+        data = self.data_cache[file_idx]
+        mu = data['mu']
+        action = data['action']
+        max_start = len(action) - self.seq_len - 1
 
-        mu = data['mu'] # (1001, 32)
-        action = data['action'] # (1000, 3)
-
-        start_idx = np.random.randint(0, len(action) - self.seq_len)
+        if max_start < 0:
+            raise ValueError(f"Episode at index {file_idx} is too short for seq_len {self.seq_len}")
+        
+        start_idx = np.random.randint(0, max_start + 1)
         end_idx = start_idx + self.seq_len
 
         z_input = mu[start_idx : end_idx]
@@ -172,3 +203,35 @@ class LatentSeqDataset(Dataset):
             'a_input': torch.FloatTensor(a_input),
             'z_target': torch.FloatTensor(z_target)
         }
+
+# class LatentSeqDataset(Dataset):
+#     def __init__(self, data_dir, seq_len=32):
+#         super().__init__()
+#         self.data_dir = data_dir
+#         self.seq_len = seq_len
+#         self.files = [f for f in os.listdir(data_dir) if f.endswith('.npz')]
+#         self.files.sort()
+# 
+#     def __len__(self):
+#         return len(self.files)
+# 
+#     def __getitem__(self, index):
+#         # Load one episode
+#         filepath = os.path.join(self.data_dir, self.files[index])
+#         data = np.load(filepath)
+# 
+#         mu = data['mu'] # (1001, 32)
+#         action = data['action'] # (1000, 3)
+# 
+#         start_idx = np.random.randint(0, len(action) - self.seq_len)
+#         end_idx = start_idx + self.seq_len
+# 
+#         z_input = mu[start_idx : end_idx]
+#         a_input = action[start_idx : end_idx]
+#         z_target = mu[start_idx+1 : end_idx+1]
+# 
+#         return {
+#             'z_input': torch.FloatTensor(z_input),
+#             'a_input': torch.FloatTensor(a_input),
+#             'z_target': torch.FloatTensor(z_target)
+#         }

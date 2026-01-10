@@ -6,7 +6,7 @@ import sys
 RESIZE_SIZE = 64
 ACTION_SIZE = 3
 LATENT_SIZE = 32
-HIDDEN_SIZE = 512
+HIDDEN_SIZE = 256
 
 def save_checkpoint(state, is_best, filename, best_filename):
     """ Save state in filename. Also save in best_filename if is_best. """
