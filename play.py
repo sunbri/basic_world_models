@@ -38,10 +38,7 @@ def play(args):
     # 4. Setup Environment
     render_mode = "human" if not args.record else "rgb_array"
     # Note: Using v2 as it is the standard stable version, but v3 works if installed
-    try:
-        env = gym.make('CarRacing-v2', render_mode=render_mode)
-    except:
-        env = gym.make('CarRacing-v3', render_mode=render_mode)
+    env = gym.make('CarRacing-v3', render_mode=render_mode)
         
     env = ResizeObservationWrapper(env, shape=(64, 64))
 

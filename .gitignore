@@ -5,6 +5,8 @@ build/
 dist/
 wheels/
 logs/
+videos/
+videos_vision_only/
 datasets/
 *.egg-info
 .vscode/
